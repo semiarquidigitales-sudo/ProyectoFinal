@@ -1,0 +1,143 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FinTech Nova - Pipeline CI/CD con DevSecOps
+# Sesión 14: CI/CD y Despliegue Continuo
+#
+# Este archivo define el pipeline automatizado que se ejecuta en GitHub Actions.
+# Cada vez que un desarrollador sube código a la rama "main",
+# este pipeline verifica seguridad y construye la imagen Docker.
+#
+# FLUJO COMPLETO:
+#   git push → GitHub detecta cambio → Crea VM Ubuntu → Ejecuta pasos:
+#   1. Descargar código
+#   2. Configurar Python
+#   3. Instalar dependencias
+#   4. [SEGURIDAD] Auditoría con pip-audit → si falla, STOP ❌
+#   5. [CALIDAD] Ejecutar pruebas → si falla, STOP ❌
+#   6. Construir imagen Docker ✅
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Nombre visible en la pestaña "Actions" de GitHub
+name: "CI/CD Pipeline - FinTech Nova"
+
+# ── DISPARADOR: ¿Cuándo se activa este pipeline? ─────────────────────────────
+on:
+  # Se activa con cada push (subida de código)
+  push:
+    branches:
+      - main        # Solo en la rama principal (código de producción)
+
+  # También permite ejecutarlo manualmente desde la interfaz de GitHub
+  workflow_dispatch:
+
+# ── TRABAJOS: Qué hace el pipeline ───────────────────────────────────────────
+jobs:
+
+  # ── JOB 1: Seguridad + Calidad + Build ──────────────────────────────────────
+  build-and-security:
+    name: "Seguridad, Pruebas y Build"
+    
+    # Sistema operativo de la máquina virtual donde corre el pipeline
+    # ubuntu-latest = Ubuntu más reciente disponible en GitHub Actions
+    runs-on: ubuntu-latest
+
+    # ── PASOS: Secuencia de acciones dentro del job ─────────────────────────
+    steps:
+
+      # ── PASO 1: Descargar el código ──────────────────────────────────────
+      # La VM de GitHub está vacía al inicio. Este paso descarga el código
+      # del repositorio a la VM para que los pasos siguientes puedan usarlo.
+      - name: "📥 Descargar código del repositorio"
+        uses: actions/checkout@v4
+        # "uses" significa: usa una acción pre-construida por GitHub/comunidad
+        # actions/checkout@v4 → versión 4 de la acción oficial de checkout
+
+      # ── PASO 2: Configurar Python ────────────────────────────────────────
+      # Aunque Ubuntu incluye Python, instalamos la versión exacta que
+      # usa el equipo de desarrollo para garantizar consistencia total.
+      - name: "🐍 Configurar Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # cache: 'pip' guarda las dependencias descargadas entre ejecuciones
+          # → builds más rápidos (no re-descarga si requirements.txt no cambió)
+          cache: "pip"
+
+      # ── PASO 3: Instalar dependencias ────────────────────────────────────
+      # Instala todas las librerías listadas en requirements.txt.
+      # Sin este paso, ni las pruebas ni pip-audit pueden ejecutarse.
+      - name: "📦 Instalar dependencias"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── PASO 4: AUDITORÍA DE SEGURIDAD (SHIFT-LEFT) ──────────────────────
+      # Este es el paso de seguridad central del enfoque DevSecOps.
+      # pip-audit analiza requirements.txt contra bases de datos de
+      # vulnerabilidades conocidas (OSV de Google + NVD del NIST).
+      #
+      # Si encuentra vulnerabilidades → código de salida != 0 → PIPELINE SE DETIENE
+      # El código NO llega al paso de construcción Docker.
+      #
+      # Esto implementa "Shift-Left": seguridad se verifica antes de producción.
+      - name: "🔒 Auditoría de Seguridad con pip-audit"
+        run: |
+          pip install pip-audit
+          echo "Analizando dependencias en busca de vulnerabilidades conocidas..."
+          pip-audit --requirement requirements.txt --format=columns
+          echo "✅ Auditoría de seguridad completada - sin vulnerabilidades encontradas"
+
+      # ── PASO 5: PRUEBAS AUTOMÁTICAS ──────────────────────────────────────
+      # Ejecuta la suite de pruebas unitarias definida en app/test_main.py
+      # Si alguna prueba falla, el pipeline se detiene aquí.
+      # El flag -v (verbose) muestra cada prueba individual en los logs.
+      - name: "🧪 Ejecutar pruebas automáticas"
+        run: |
+          echo "Ejecutando suite de pruebas de FinTech Nova..."
+          pytest app/test_main.py -v --tb=short
+          echo "✅ Todas las pruebas pasaron correctamente"
+
+      # ── PASO 6: CONSTRUIR IMAGEN DOCKER ──────────────────────────────────
+      # Solo llegamos aquí si los pasos 4 y 5 pasaron exitosamente.
+      # Esto garantiza que solo se construyen imágenes de código:
+      # - Sin vulnerabilidades de seguridad
+      # - Con todas las pruebas pasando
+      #
+      # La imagen se etiqueta con el SHA del commit (identificador único).
+      # Ejemplo: fintech-nova:a3f2c91b
+      # Esto permite saber EXACTAMENTE qué versión de código está en cada imagen.
+      - name: "🐳 Construir imagen Docker"
+        run: |
+          echo "Construyendo imagen Docker de FinTech Nova..."
+          docker build -t fintech-nova:${{ github.sha }} .
+          docker build -t fintech-nova:latest .
+          echo "✅ Imagen construida: fintech-nova:${{ github.sha }}"
+
+      # ── PASO 7: VERIFICAR IMAGEN CONSTRUIDA ──────────────────────────────
+      # Verifica que la imagen existe y muestra información básica.
+      # Un smoke test básico: la imagen debe arrancar sin errores.
+      - name: "✅ Verificar imagen Docker"
+        run: |
+          echo "=== Imágenes construidas ==="
+          docker images | grep fintech-nova
+          echo ""
+          echo "=== Iniciando contenedor para smoke test ==="
+          docker run -d --name fintech-test -p 8000:8000 fintech-nova:latest
+          sleep 3
+          echo "=== Verificando health check ==="
+          curl --fail http://localhost:8000/health || (docker logs fintech-test && exit 1)
+          echo ""
+          echo "✅ Smoke test exitoso - la API responde correctamente"
+          docker stop fintech-test
+          docker rm fintech-test
+
+      # ── PASO 8: RESUMEN FINAL ─────────────────────────────────────────────
+      - name: "📊 Resumen del Pipeline"
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  PIPELINE COMPLETADO EXITOSAMENTE ✅"
+          echo "══════════════════════════════════════════"
+          echo "  Repositorio : ${{ github.repository }}"
+          echo "  Rama        : ${{ github.ref_name }}"
+          echo "  Commit      : ${{ github.sha }}"
+          echo "  Imagen      : fintech-nova:${{ github.sha }}"
+          echo "══════════════════════════════════════════"
